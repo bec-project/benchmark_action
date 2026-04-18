@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "benchmark-action"
-version = "1.0.0"
+version = "0.1.0"
 description = "GitHub Action to run, aggregate, compare, and publish benchmark results"
 requires-python = ">=3.11"
 dependencies = [
