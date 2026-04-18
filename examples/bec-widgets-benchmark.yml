@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: BW Benchmarks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  QTWEBENGINE_DISABLE_SANDBOX: 1
+  QT_QPA_PLATFORM: offscreen
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    defaults:
+      run:
+        shell: bash -el {0}
+
+    steps:
+      - name: Checkout BEC Widgets
+        uses: actions/checkout@v4
+
+      - name: Set up Conda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          auto-update-conda: true
+          auto-activate-base: true
+          python-version: "3.11"
+
+      - name: Run, compare, and publish benchmarks
+        uses: bec-project/benchmark_action@v1
+        with:
+          mode: all
+          attempts: "3"
+          system-packages: libgl1 libegl1 x11-utils libxkbcommon-x11-0 libdbus-1-3 xvfb libnss3 libxdamage1 libasound2t64 libatomic1 libxcursor1 ttyd hyperfine redis-server
+          setup-scripts: .github/scripts/setup_benchmark_env.sh
+          benchmark-scripts: |
+            tests/benchmarks/hyperfine/benchmark_import_bec_widgets.sh
+            tests/benchmarks/hyperfine/benchmark_launch_bec_with_companion.sh
+            tests/benchmarks/hyperfine/benchmark_launch_bec_without_companion.sh
+          benchmark-pytest-dirs: tests/unit_tests/benchmarks
+          threshold-percent: "10"

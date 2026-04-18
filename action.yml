@@ -1,0 +1,346 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-action.json
+name: Benchmark Action
+description: Run, aggregate, compare, and publish benchmark results.
+author: bec-project
+
+branding:
+  icon: activity
+  color: blue
+
+inputs:
+  mode:
+    description: "Action phase to run: all, run, aggregate, compare, or publish."
+    required: false
+    default: all
+  working-directory:
+    description: Directory containing the checked-out project.
+    required: false
+    default: .
+  benchmark-json:
+    description: Benchmark JSON path used by run, compare, and publish modes.
+    required: false
+    default: benchmark-results/current.json
+  benchmark-command:
+    description: Command that produces benchmark-json in run mode.
+    required: false
+    default: bash "$GITHUB_ACTION_PATH/scripts/run_benchmarks.sh"
+  attempts:
+    description: Number of benchmark attempts to run in all mode.
+    required: false
+    default: "1"
+  min-successful-attempts:
+    description: Minimum successful benchmark attempts required in all mode.
+    required: false
+    default: "1"
+  system-packages:
+    description: Space-separated Ubuntu packages to install before setup scripts run.
+    required: false
+    default: ""
+  setup-scripts:
+    description: Newline- or space-separated setup scripts to run before benchmarks.
+    required: false
+    default: ""
+  benchmark-scripts:
+    description: Newline- or space-separated benchmark scripts to run with hyperfine.
+    required: false
+    default: ""
+  benchmark-hyperfine-dir:
+    description: Directory containing benchmark_*.sh scripts.
+    required: false
+    default: tests/benchmarks/hyperfine
+  benchmark-pytest-dirs:
+    description: Space-separated pytest-benchmark directories.
+    required: false
+    default: ""
+  aggregate-input-dir:
+    description: Directory containing benchmark JSON files to aggregate.
+    required: false
+    default: benchmark-results/attempts
+  baseline-json:
+    description: Baseline benchmark JSON path used by compare mode.
+    required: false
+    default: gh-pages-benchmark-data/benchmarks/latest.json
+  summary-path:
+    description: Markdown summary path written by compare mode.
+    required: false
+    default: benchmark-results/summary.md
+  threshold-percent:
+    description: Regression threshold percentage.
+    required: false
+    default: "10"
+  higher-is-better:
+    description: Treat lower current values as regressions.
+    required: false
+    default: "false"
+  fail-on-regression:
+    description: Exit non-zero in compare mode when regressions exceed the threshold.
+    required: false
+    default: "true"
+  comment-marker:
+    description: HTML marker embedded in comparison summaries for PR comment updates.
+    required: false
+    default: "<!-- bw-benchmark-comment -->"
+  comment-on-pr:
+    description: Create or update a benchmark comparison comment on pull requests in all mode.
+    required: false
+    default: "true"
+  publish-on-main:
+    description: Publish benchmark data on pushes to the main branch in all mode.
+    required: false
+    default: "true"
+  gh-pages-dir:
+    description: Worktree directory used by compare and publish modes for gh-pages data.
+    required: false
+    default: gh-pages-benchmark-data
+  publish-branch:
+    description: Branch where publish mode writes benchmark data.
+    required: false
+    default: gh-pages
+  history-dir:
+    description: Directory within publish-branch that stores benchmark data.
+    required: false
+    default: benchmarks
+  commit-message:
+    description: Commit message used by publish mode.
+    required: false
+    default: "Update benchmark data"
+
+outputs:
+  benchmark-json:
+    description: Path to the current or aggregate benchmark JSON.
+    value: ${{ steps.paths.outputs.benchmark_json }}
+  summary-path:
+    description: Path to the benchmark comparison summary.
+    value: ${{ steps.paths.outputs.summary_path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve output paths
+      id: paths
+      shell: bash
+      run: |
+        echo "benchmark_json=${{ inputs.benchmark-json }}" >> "$GITHUB_OUTPUT"
+        echo "summary_path=${{ inputs.summary-path }}" >> "$GITHUB_OUTPUT"
+
+    - name: Validate mode
+      shell: bash
+      run: |
+        case "${{ inputs.mode }}" in
+          all|run|aggregate|compare|publish) ;;
+          *)
+            echo "Unsupported benchmark action mode: ${{ inputs.mode }}" >&2
+            exit 2
+            ;;
+        esac
+
+    - name: Install Ubuntu benchmark packages
+      if: (inputs.mode == 'all' || inputs.mode == 'run') && inputs.system-packages != ''
+      shell: bash
+      env:
+        SYSTEM_PACKAGES: ${{ inputs.system-packages }}
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y $SYSTEM_PACKAGES
+
+    - name: Run benchmarks
+      if: inputs.mode == 'all' || inputs.mode == 'run'
+      working-directory: ${{ inputs.working-directory }}
+      shell: bash
+      env:
+        BENCHMARK_JSON: ${{ inputs.benchmark-json }}
+        BENCHMARK_COMMAND: ${{ inputs.benchmark-command }}
+        BENCHMARK_SETUP_SCRIPTS: ${{ inputs.setup-scripts }}
+        BENCHMARK_SCRIPTS: ${{ inputs.benchmark-scripts }}
+        BENCHMARK_HYPERFINE_DIR: ${{ inputs.benchmark-hyperfine-dir }}
+        BENCHMARK_PYTEST_DIRS: ${{ inputs.benchmark-pytest-dirs }}
+        BENCHMARK_MODE: ${{ inputs.mode }}
+        BENCHMARK_ATTEMPTS: ${{ inputs.attempts }}
+        BENCHMARK_MIN_SUCCESSFUL_ATTEMPTS: ${{ inputs.min-successful-attempts }}
+        BENCHMARK_ATTEMPT_DIR: ${{ inputs.aggregate-input-dir }}
+      run: |
+        run_setup_script() {
+          local script="$1"
+          if [ -z "$script" ]; then
+            return 0
+          fi
+          if [ ! -f "$script" ]; then
+            echo "Setup script not found: $script" >&2
+            exit 1
+          fi
+          echo "Running registered setup script: $script"
+          case "$script" in
+            *.py) python "$script" ;;
+            *) source "$script" ;;
+          esac
+        }
+
+        if [ -n "$BENCHMARK_SETUP_SCRIPTS" ]; then
+          while IFS= read -r setup_script_line; do
+            for setup_script in $setup_script_line; do
+              run_setup_script "$setup_script"
+            done
+          done <<< "$BENCHMARK_SETUP_SCRIPTS"
+        fi
+
+        python -m pip install "$GITHUB_ACTION_PATH"
+
+        if [ "$BENCHMARK_MODE" = "run" ]; then
+          mkdir -p "$(dirname "$BENCHMARK_JSON")"
+          bash -lc "$BENCHMARK_COMMAND"
+          test -s "$BENCHMARK_JSON"
+          exit 0
+        fi
+
+        if ! [[ "$BENCHMARK_ATTEMPTS" =~ ^[0-9]+$ ]] || [ "$BENCHMARK_ATTEMPTS" -lt 1 ]; then
+          echo "attempts must be a positive integer" >&2
+          exit 2
+        fi
+        if ! [[ "$BENCHMARK_MIN_SUCCESSFUL_ATTEMPTS" =~ ^[0-9]+$ ]] || [ "$BENCHMARK_MIN_SUCCESSFUL_ATTEMPTS" -lt 1 ]; then
+          echo "min-successful-attempts must be a positive integer" >&2
+          exit 2
+        fi
+
+        rm -rf "$BENCHMARK_ATTEMPT_DIR"
+        mkdir -p "$BENCHMARK_ATTEMPT_DIR" "$(dirname "$BENCHMARK_JSON")"
+        successful_attempts=0
+        for attempt in $(seq 1 "$BENCHMARK_ATTEMPTS"); do
+          attempt_json="$BENCHMARK_ATTEMPT_DIR/current-${attempt}.json"
+          echo "Running benchmark attempt ${attempt}/${BENCHMARK_ATTEMPTS}"
+          set +e
+          BENCHMARK_JSON="$attempt_json" bash -lc "$BENCHMARK_COMMAND"
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ] && [ -s "$attempt_json" ]; then
+            successful_attempts=$((successful_attempts + 1))
+          else
+            echo "Benchmark attempt ${attempt} failed with status ${status}" >&2
+          fi
+        done
+
+        if [ "$successful_attempts" -lt "$BENCHMARK_MIN_SUCCESSFUL_ATTEMPTS" ]; then
+          echo "Only ${successful_attempts} benchmark attempt(s) succeeded; required ${BENCHMARK_MIN_SUCCESSFUL_ATTEMPTS}" >&2
+          exit 1
+        fi
+
+        python "$GITHUB_ACTION_PATH/scripts/aggregate_benchmarks.py" \
+          --input-dir "$BENCHMARK_ATTEMPT_DIR" \
+          --output "$BENCHMARK_JSON"
+        test -s "$BENCHMARK_JSON"
+
+    - name: Aggregate benchmark JSON files
+      if: inputs.mode == 'aggregate'
+      working-directory: ${{ inputs.working-directory }}
+      shell: bash
+      run: |
+        python "$GITHUB_ACTION_PATH/scripts/aggregate_benchmarks.py" \
+          --input-dir "${{ inputs.aggregate-input-dir }}" \
+          --output "${{ inputs.benchmark-json }}"
+
+    - name: Fetch benchmark baseline
+      if: inputs.mode == 'all' || inputs.mode == 'compare'
+      working-directory: ${{ inputs.working-directory }}
+      shell: bash
+      env:
+        GH_PAGES_DIR: ${{ inputs.gh-pages-dir }}
+        PUBLISH_BRANCH: ${{ inputs.publish-branch }}
+      run: |
+        if git ls-remote --exit-code --heads origin "$PUBLISH_BRANCH"; then
+          git clone --depth=1 --branch "$PUBLISH_BRANCH" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$GH_PAGES_DIR"
+        else
+          mkdir -p "$GH_PAGES_DIR"
+        fi
+
+    - name: Compare benchmark JSON files
+      id: compare
+      if: inputs.mode == 'all' || inputs.mode == 'compare'
+      working-directory: ${{ inputs.working-directory }}
+      shell: bash
+      env:
+        BASELINE_JSON: ${{ inputs.baseline-json }}
+        BENCHMARK_JSON: ${{ inputs.benchmark-json }}
+        BENCHMARK_SUMMARY: ${{ inputs.summary-path }}
+        BENCHMARK_THRESHOLD_PERCENT: ${{ inputs.threshold-percent }}
+        BENCHMARK_HIGHER_IS_BETTER: ${{ inputs.higher-is-better }}
+        FAIL_ON_REGRESSION: ${{ inputs.fail-on-regression }}
+        COMMENT_MARKER: ${{ inputs.comment-marker }}
+        BENCHMARK_MODE: ${{ inputs.mode }}
+      run: |
+        if [ ! -s "$BASELINE_JSON" ]; then
+          mkdir -p "$(dirname "$BENCHMARK_SUMMARY")"
+          {
+            echo "$COMMENT_MARKER"
+            echo "## Benchmark comparison"
+            echo
+            echo "No benchmark baseline was found on ${{ inputs.publish-branch }}."
+          } > "$BENCHMARK_SUMMARY"
+          echo "status=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        args=(
+          --baseline "$BASELINE_JSON"
+          --current "$BENCHMARK_JSON"
+          --summary "$BENCHMARK_SUMMARY"
+          --threshold-percent "$BENCHMARK_THRESHOLD_PERCENT"
+          --comment-marker "$COMMENT_MARKER"
+        )
+        if [ "$BENCHMARK_HIGHER_IS_BETTER" = "true" ]; then
+          args+=(--higher-is-better)
+        fi
+
+        set +e
+        python "$GITHUB_ACTION_PATH/scripts/compare_benchmarks.py" "${args[@]}"
+        status=$?
+        set -e
+        echo "status=$status" >> "$GITHUB_OUTPUT"
+
+        if [ ! -s "$BENCHMARK_SUMMARY" ]; then
+          mkdir -p "$(dirname "$BENCHMARK_SUMMARY")"
+          {
+            echo "$COMMENT_MARKER"
+            echo "## Benchmark comparison"
+            echo
+            echo "Benchmark comparison failed before writing a summary."
+          } > "$BENCHMARK_SUMMARY"
+        fi
+
+        if [ "$BENCHMARK_MODE" = "compare" ] && [ "$FAIL_ON_REGRESSION" = "true" ]; then
+          exit "$status"
+        fi
+        exit 0
+
+    - name: Find existing benchmark PR comment
+      if: inputs.mode == 'all' && github.event_name == 'pull_request' && inputs.comment-on-pr == 'true'
+      id: find-comment
+      uses: peter-evans/find-comment@v3
+      with:
+        issue-number: ${{ github.event.pull_request.number }}
+        comment-author: github-actions[bot]
+        body-includes: ${{ inputs.comment-marker }}
+
+    - name: Create or update benchmark PR comment
+      if: inputs.mode == 'all' && github.event_name == 'pull_request' && inputs.comment-on-pr == 'true'
+      uses: peter-evans/create-or-update-comment@v5
+      with:
+        issue-number: ${{ github.event.pull_request.number }}
+        comment-id: ${{ steps.find-comment.outputs.comment-id }}
+        body-path: ${{ inputs.summary-path }}
+        edit-mode: replace
+
+    - name: Fail on benchmark regression
+      if: inputs.mode == 'all' && github.event_name == 'pull_request' && inputs.fail-on-regression == 'true' && steps.compare.outputs.status != '0'
+      shell: bash
+      run: exit 1
+
+    - name: Publish benchmark data
+      if: inputs.mode == 'publish' || (inputs.mode == 'all' && github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.publish-on-main == 'true')
+      working-directory: ${{ inputs.working-directory }}
+      shell: bash
+      env:
+        BENCHMARK_JSON: ${{ inputs.benchmark-json }}
+        GH_PAGES_DIR: ${{ inputs.gh-pages-dir }}
+        PUBLISH_BRANCH: ${{ inputs.publish-branch }}
+        HISTORY_DIR: ${{ inputs.history-dir }}
+        COMMIT_MESSAGE: ${{ inputs.commit-message }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/publish_benchmark_data.sh"
